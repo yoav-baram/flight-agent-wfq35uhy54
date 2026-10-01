@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "flight-results-page",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["tsx", "--env-file=.env", "src/results.ts"],
+      "port": 3100,
+      "autoPort": true
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "name": "flight-mcp",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "tsx --env-file=.env src/index.ts",
+    "monitor": "tsx --env-file=.env src/monitor.ts",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "vacation-monitor": "tsx --env-file=.env src/vacationMonitor.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.0.0",
+    "google-flights-ts": "^1.0.0",
+    "playwright": "^1.63.0",
+    "tsx": "^4.23.13",
+    "zod": "^4.6.5"
+  }
+}
