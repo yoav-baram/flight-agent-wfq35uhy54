@@ -396,7 +396,16 @@ async function checkAlert(
       formatAlertMessage(
         alert,
         cheapestQualifyingOffer
-      )
+      ),
+      {
+        click: cheapestQualifyingOffer.bookingUrl,
+        actions: [
+          {
+            label: "Open flights",
+            url: cheapestQualifyingOffer.bookingUrl,
+          },
+        ],
+      }
     );
 
     store.setLastNotifiedPrice(

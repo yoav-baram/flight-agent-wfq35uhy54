@@ -25,12 +25,17 @@ interface StoreData {
    * key, so we don't re-notify at the same price repeatedly.
    */
   lastNotified: Record<string, number>;
+  /*
+   * When (epoch ms) each key was last notified, so callers can
+   * enforce a cooldown between notifications.
+   */
+  lastNotifiedAt: Record<string, number>;
 }
 
 const ROLLING_WINDOW_MS = 90 * 24 * 60 * 60 * 1000;
 
 function emptyStore(): StoreData {
-  return { history: {}, lastNotified: {} };
+  return { history: {}, lastNotified: {}, lastNotifiedAt: {} };
 }
 
 export class PriceHistoryStore {
@@ -75,6 +80,12 @@ export class PriceHistoryStore {
           parsed?.lastNotified &&
           typeof parsed.lastNotified === "object"
             ? parsed.lastNotified
+            : {},
+
+        lastNotifiedAt:
+          parsed?.lastNotifiedAt &&
+          typeof parsed.lastNotifiedAt === "object"
+            ? parsed.lastNotifiedAt
             : {},
       };
     } catch (error) {
@@ -176,11 +187,17 @@ export class PriceHistoryStore {
     return this.data.lastNotified[key];
   }
 
+  getLastNotifiedAt(key: string): number | undefined {
+    return this.data.lastNotifiedAt[key];
+  }
+
   setLastNotifiedPrice(
     key: string,
-    price: number
+    price: number,
+    now: number = Date.now()
   ): void {
     this.data.lastNotified[key] = price;
+    this.data.lastNotifiedAt[key] = now;
     this.persist();
   }
 }

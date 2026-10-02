@@ -1,5 +1,9 @@
 import { setTimeout as delay } from "node:timers/promises";
-import { searchFlights, type FlightOffer } from "./duffel.js";
+import {
+  RateLimitedError,
+  searchFlights,
+  type FlightOffer,
+} from "./duffel.js";
 import { getSchoolBreaks } from "./schoolCalendar.js";
 import {
   getTripWindowDays,
@@ -17,12 +21,28 @@ export interface SchoolVacationFlightSearch {
   cabinClass: "economy" | "premium_economy" | "business" | "first";
 }
 
+/*
+ * Outbound stop counts we report the cheapest flight for.
+ */
+export const TRACKED_STOP_COUNTS = [0, 1, 2] as const;
+
 export interface VacationFlightResult {
   vacation: string;
   windowStart: string;
   windowEnd: string;
   days: number;
+  /*
+   * The cheapest offers overall (top 10) - for browsing/ranking.
+   */
   offers: FormattedVacationOffer[];
+  /*
+   * The cheapest offer for each tracked outbound stop count,
+   * kept separately because nonstops are usually pricier and would
+   * otherwise be cut off by the "cheapest 10" above.
+   */
+  cheapestByStops: Partial<
+    Record<number, FormattedVacationOffer>
+  >;
 }
 
 /*
@@ -72,13 +92,22 @@ function addDays(dateString: string, days: number): string {
   return date.toISOString().slice(0, 10);
 }
 
-function getDateCombinations(
+/*
+ * Above this many days, a window (summer break) is long enough that
+ * the short-break sampling strategy below would generate 70-100+
+ * searches for a single window - a combinatorial blow-up against an
+ * already rate-limit-sensitive scraper, and not even a realistic
+ * trip shape (nobody books a 7-9 day trip out of a 10-week break).
+ */
+const LONG_WINDOW_THRESHOLD_DAYS = 20;
+
+const LONG_WINDOW_DEPARTURE_STRIDE_DAYS = 7;
+const LONG_WINDOW_TRIP_LENGTHS = [20, 25, 30];
+
+function listDatesInWindow(
   startDate: string,
   endDate: string
-): Array<{
-  departureDate: string;
-  returnDate: string;
-}> {
+): string[] {
   const dates: string[] = [];
 
   const start = new Date(`${startDate}T00:00:00Z`);
@@ -92,23 +121,25 @@ function getDateCombinations(
     dates.push(date.toISOString().slice(0, 10));
   }
 
+  return dates;
+}
+
+function sampleCombinations(
+  dates: string[],
+  end: Date,
+  departureStride: number,
+  tripLengths: number[]
+): Array<{ departureDate: string; returnDate: string }> {
   const combinations: Array<{
     departureDate: string;
     returnDate: string;
   }> = [];
 
-  /*
-   * Sample every other departure day with two trip lengths, rather
-   * than every single day x [5,7,9]. This search now runs on a
-   * 15-minute cycle across 4 origins, so an exhaustive sweep would
-   * mean thousands of scraped requests/day against Google Flights -
-   * a much higher risk of the origin IP getting rate-limited or
-   * blocked. This still covers each window well at a fraction of
-   * the request volume.
-   */
-  const tripLengths = [7, 9];
-
-  for (let i = 0; i < dates.length; i += 2) {
+  for (
+    let i = 0;
+    i < dates.length;
+    i += departureStride
+  ) {
     const departureDate = dates[i];
 
     for (const tripLength of tripLengths) {
@@ -133,7 +164,54 @@ function getDateCombinations(
     }
   }
 
-  // Always include the full vacation window.
+  return combinations;
+}
+
+function getDateCombinations(
+  startDate: string,
+  endDate: string
+): Array<{
+  departureDate: string;
+  returnDate: string;
+}> {
+  const dates = listDatesInWindow(startDate, endDate);
+  const end = new Date(`${endDate}T00:00:00Z`);
+
+  const isLongWindow =
+    dates.length > LONG_WINDOW_THRESHOLD_DAYS;
+
+  /*
+   * Short breaks (Dec/Feb/April recess): sample every other
+   * departure day with two trip lengths, rather than every single
+   * day x [5,7,9] - an exhaustive sweep would mean thousands of
+   * scraped requests against Google Flights, a much higher risk of
+   * getting rate-limited or blocked. This still covers each window
+   * well at a fraction of the request volume. The whole window is
+   * itself a sensible trip here, so it is always included.
+   *
+   * Summer break: a ~10-week window. Trips of 20-30 days, departing
+   * weekly. The wanted range is 20-40 days, but trips longer than
+   * 30 days come back with nothing readable from a plain request
+   * (checked live across every departure: 20/25/30 all read, 35/40
+   * never do - Google fills those results in with JavaScript, so
+   * they show on google.com but not in the data we can fetch), so
+   * searching them would only waste requests. The whole 66-day
+   * window is skipped for the same reason and because it is far
+   * outside the wanted trip length. Return dates past Google's
+   * ~330-day booking horizon also come back empty until they come
+   * into range; that fills in on its own over time.
+   */
+  if (isLongWindow) {
+    return sampleCombinations(
+      dates,
+      end,
+      LONG_WINDOW_DEPARTURE_STRIDE_DAYS,
+      LONG_WINDOW_TRIP_LENGTHS
+    );
+  }
+
+  const combinations = sampleCombinations(dates, end, 2, [7, 9]);
+
   combinations.push({
     departureDate: startDate,
     returnDate: endDate,
@@ -219,6 +297,15 @@ export async function searchSchoolVacationFlights(
 
         allOffers.push(...offers);
       } catch (error) {
+        /*
+         * A real block ends this origin's search immediately - the
+         * remaining combinations would only be more requests into
+         * a service that is refusing us.
+         */
+        if (error instanceof RateLimitedError) {
+          throw error;
+        }
+
         failedCombinations++;
 
         console.error(
@@ -235,7 +322,15 @@ export async function searchSchoolVacationFlights(
     const uniqueOffers = new Map<string, FlightOffer>();
 
     for (const offer of allOffers) {
+      /*
+       * The searched dates are part of the identity: segment
+       * timestamps are often null, so without them the same flight
+       * priced identically on two different date pairs would
+       * collapse into one entry.
+       */
       const key = JSON.stringify({
+        departureDate: offer.departureDate,
+        returnDate: offer.returnDate,
         price: offer.totalAmount,
         currency: offer.totalCurrency,
         slices: offer.slices.map((slice) =>
@@ -251,20 +346,34 @@ export async function searchSchoolVacationFlights(
       uniqueOffers.set(key, offer);
     }
 
-    const sortedOffers = [...uniqueOffers.values()]
-      .sort(
-        (a, b) =>
-          Number(a.totalAmount) -
-          Number(b.totalAmount)
-      )
-      .slice(0, 10);
+    const sortedOffers = [...uniqueOffers.values()].sort(
+      (a, b) =>
+        Number(a.totalAmount) - Number(b.totalAmount)
+    );
+
+    const cheapestByStops: Partial<
+      Record<number, FormattedVacationOffer>
+    > = {};
+
+    for (const stops of TRACKED_STOP_COUNTS) {
+      const cheapest = sortedOffers.find(
+        (offer) => (offer.slices[0]?.stops ?? 0) === stops
+      );
+
+      if (cheapest) {
+        cheapestByStops[stops] = formatVacationOffer(cheapest);
+      }
+    }
 
     results.push({
       vacation: schoolBreak.name,
       windowStart: schoolBreak.tripWindowStart,
       windowEnd: schoolBreak.tripWindowEnd,
       days: getTripWindowDays(schoolBreak),
-      offers: sortedOffers.map(formatVacationOffer),
+      offers: sortedOffers
+        .slice(0, 10)
+        .map(formatVacationOffer),
+      cheapestByStops,
     });
   }
 
@@ -281,73 +390,9 @@ export async function searchSchoolVacationFlights(
   ) {
     throw new Error(
       `All ${totalCombinations} flight searches failed for ` +
-        `${input.origin} -> ${input.destination} - the scraper ` +
-        `may be rate-limited or blocked, not just seeing empty results.`
+        `${input.origin} -> ${input.destination} - no network, or ` +
+        `Google is refusing requests; not just empty results.`
     );
-  }
-
-  return results;
-}
-
-/*
- * Open-jaw check: depart one origin, return into a DIFFERENT one.
- * Deliberately lightweight (only the full vacation-window date
- * pair per break, no combinatorial sampling) since this runs
- * alongside the regular per-origin search and adds meaningfully to
- * the total request volume against an already rate-limit-sensitive
- * scraper.
- */
-export interface OpenJawFlightResult {
-  vacation: string;
-  windowStart: string;
-  windowEnd: string;
-  offer: FormattedVacationOffer | null;
-}
-
-export async function searchOpenJawFlights(
-  origin: string,
-  destination: string,
-  returnAirport: string,
-  adults: number,
-  cabinClass:
-    | "economy"
-    | "premium_economy"
-    | "business"
-    | "first"
-): Promise<OpenJawFlightResult[]> {
-  const schoolBreaks = getSchoolBreaks();
-  const results: OpenJawFlightResult[] = [];
-
-  for (const schoolBreak of schoolBreaks) {
-    try {
-      const offers = await searchFlights({
-        origin,
-        destination,
-        departureDate: schoolBreak.tripWindowStart,
-        returnDate: schoolBreak.tripWindowEnd,
-        adults,
-        cabinClass,
-        openJawReturnAirport: returnAirport,
-      });
-
-      results.push({
-        vacation: schoolBreak.name,
-        windowStart: schoolBreak.tripWindowStart,
-        windowEnd: schoolBreak.tripWindowEnd,
-        offer: offers[0]
-          ? formatVacationOffer(offers[0])
-          : null,
-      });
-    } catch (error) {
-      console.error(
-        `[open-jaw-search] Search failed for ` +
-          `${origin} -> ${destination} -> ${returnAirport} ` +
-          `${schoolBreak.name}: ` +
-          `${error instanceof Error ? error.message : String(error)}`
-      );
-    }
-
-    await delay(500);
   }
 
   return results;

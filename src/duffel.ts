@@ -1,11 +1,7 @@
-import {
-  FlightData,
-  Passengers,
-  TFSData,
-  getFlightsFromFilter,
-} from "google-flights-ts";
+import { getFlightsFromFilter } from "google-flights-ts";
 
 import { getBookingUrl } from "./bookingLink.js";
+import { buildTfs } from "./tfs.js";
 
 export type CabinClass =
   | "economy"
@@ -20,11 +16,6 @@ export interface SearchFlightsInput {
   returnDate?: string;
   adults: number;
   cabinClass: CabinClass;
-  /*
-   * Open-jaw support: where the return leg lands. Defaults to
-   * `origin` (a normal round trip) when omitted.
-   */
-  openJawReturnAirport?: string;
   /*
    * ISO 4217 currency code (e.g. "EUR"). Google Flights can price
    * the same route differently by currency/point-of-sale - this
@@ -55,6 +46,16 @@ export interface FlightSlice {
 
 export interface FlightOffer {
   id: string;
+  /*
+   * The trip that was SEARCHED to produce this offer. Segment
+   * timestamps from the scraper are frequently null, but these are
+   * always known and are exactly the dates the price and booking
+   * link correspond to.
+   */
+  origin: string;
+  destination: string;
+  departureDate: string;
+  returnDate?: string;
   totalAmount: string;
   totalCurrency: string;
   bookingUrl: string;
@@ -84,6 +85,63 @@ export class DuffelApiError extends Error {
     this.name = "FlightSearchError";
     this.status = status;
   }
+}
+
+/*
+ * Google is actively refusing us (HTTP 429 / "unusual traffic" page).
+ * Distinct from an ordinary failed search so callers can stop
+ * instead of retrying dozens more requests into the same wall.
+ */
+export class RateLimitedError extends DuffelApiError {
+  constructor(message: string) {
+    super(message, 429);
+    this.name = "RateLimitedError";
+  }
+}
+
+/*
+ * Circuit breaker: after a real block, send NO requests for a
+ * while - 30 minutes, doubling on each consecutive block up to 6
+ * hours - rather than keep probing. Continuing to hammer a service
+ * that is refusing you only prolongs the block.
+ */
+const BREAKER_BASE_MS = 30 * 60 * 1000;
+const BREAKER_MAX_MS = 6 * 60 * 60 * 1000;
+
+let blockedUntil = 0;
+let consecutiveBlocks = 0;
+
+function tripBreaker(): void {
+  consecutiveBlocks++;
+
+  const backoff = Math.min(
+    BREAKER_BASE_MS * 2 ** (consecutiveBlocks - 1),
+    BREAKER_MAX_MS
+  );
+
+  blockedUntil = Date.now() + backoff;
+}
+
+function isRateLimitMessage(message: string): boolean {
+  return (
+    /^429\b/.test(message) ||
+    /unusual traffic|\/sorry\//i.test(message)
+  );
+}
+
+/*
+ * The library's decoder throws these when the response has no
+ * flight data in the shape it expects. That is what happens for
+ * date pairs whose results Google fills in with JavaScript instead
+ * of embedding them in the page (confirmed: Google's own page shows
+ * results for such a pair while the plain response carries null
+ * sections) - i.e. "nothing readable here", not a failure or a block.
+ */
+function isNoReadableResults(message: string): boolean {
+  return (
+    message.startsWith("Found non-list type") ||
+    /Index \d+ out of range when decoding/.test(message)
+  );
 }
 
 interface GoogleFlight {
@@ -138,25 +196,6 @@ interface GoogleItinerary {
 interface GoogleDecodedResult {
   best?: GoogleItinerary[];
   other?: GoogleItinerary[];
-}
-
-function mapCabinClass(
-  cabinClass: CabinClass
-): "economy" | "premium-economy" | "business" | "first" {
-  switch (cabinClass) {
-    case "premium_economy":
-      return "premium-economy";
-
-    case "business":
-      return "business";
-
-    case "first":
-      return "first";
-
-    case "economy":
-    default:
-      return "economy";
-  }
 }
 
 function formatDuration(minutes: number): string {
@@ -467,6 +506,11 @@ function makeOffer(
   return {
     id: offerId,
 
+    origin: input.origin,
+    destination: input.destination,
+    departureDate: input.departureDate,
+    returnDate: input.returnDate,
+
     totalAmount:
       summary.price.toFixed(2),
 
@@ -474,15 +518,10 @@ function makeOffer(
       summary.currency ?? "USD",
 
     /*
-     * Prefers a verified airline-specific search link (currently
-     * just Delta) and falls back to the verified-working Google
-     * Flights link. See bookingLink.ts for why nothing stronger
-     * than a prefilled search is possible.
+     * See bookingLink.ts for why a prefilled search page is the
+     * most any link can do.
      */
-    bookingUrl: getBookingUrl(
-      { slices },
-      input
-    ),
+    bookingUrl: getBookingUrl(input),
 
     slices,
 
@@ -557,77 +596,64 @@ export async function searchFlights(
     );
   }
 
-  const flightData = [
-    new FlightData({
-      date: input.departureDate,
-      from_airport: input.origin,
-      to_airport: input.destination,
-    }),
-  ];
-
-  if (input.returnDate) {
-    flightData.push(
-      new FlightData({
-        date: input.returnDate,
-        from_airport: input.destination,
-        to_airport:
-          input.openJawReturnAirport ??
-          input.origin,
-      })
+  if (Date.now() < blockedUntil) {
+    throw new RateLimitedError(
+      `Google rate-limited us; not sending requests until ` +
+        `${new Date(blockedUntil).toISOString()}.`
     );
   }
 
- const tfs = TFSData.fromInterface({
-   flight_data: flightData,
+  const tfs = buildTfs(input);
 
-   trip: input.returnDate
-     ? "round-trip"
-     : "one-way",
+  let result: unknown;
 
-   passengers: new Passengers({
-     adults: input.adults,
-   }),
-
-   seat: mapCabinClass(
-     input.cabinClass
-   ),
- });
-
- let result: unknown;
-
-try {
   /*
    * Calling getFlightsFromFilter directly (rather than the
-   * higher-level getFlights) because getFlights does not forward
-   * a `currency` option through to the request at all - confirmed
+   * higher-level getFlights) because getFlights does not forward a
+   * `currency` option through to the request at all - confirmed
    * against this library's own compiled source, not assumed.
+   *
+   * mode: "common" is the plain direct fetch with no fallback. The
+   * library's "fallback" modes route to a public Microsoft
+   * Playwright demo sandbox that now needs a token and fails every
+   * time, and a local-browser fallback of our own never recovered a
+   * single request either (488 of 488 failed in an overnight run) -
+   * it only doubled the traffic on every failure. So there is no
+   * fallback: when Google refuses us, we back off (see the breaker
+   * above) instead of escalating.
    */
-  result = await getFlightsFromFilter(tfs, {
+  try {
+    result = await getFlightsFromFilter(tfs, {
       currency: input.currency,
-
-      /*
-       * Fallback gives the library a backup
-       * fetching method if the normal request fails.
-       */
-mode: "fallback",
-
-      /*
-       * JS mode gives us the detailed structured
-       * itinerary data we need:
-       * flights, flight numbers, airports,
-       * times, prices, and layovers.
-       */
-data_source: "js",
+      mode: "common",
+      data_source: "js",
     });
   } catch (error) {
+    const message =
+      error instanceof Error
+        ? error.message
+        : String(error);
+
+    if (isRateLimitMessage(message)) {
+      tripBreaker();
+
+      throw new RateLimitedError(
+        `Google rate-limited us (backing off until ` +
+          `${new Date(blockedUntil).toISOString()}): ` +
+          message.slice(0, 120)
+      );
+    }
+
+    if (isNoReadableResults(message)) {
+      return [];
+    }
+
     throw new DuffelApiError(
-      `Google Flights search failed: ${
-        error instanceof Error
-          ? error.message
-          : String(error)
-      }`
+      `Google Flights search failed: ${message}`
     );
   }
+
+  consecutiveBlocks = 0;
 
   if (!result) {
     return [];
@@ -658,10 +684,11 @@ data_source: "js",
     );
 
   /*
-   * Cheapest first.
-   *
-   * We only keep the cheapest 20 so the MCP
-   * does not dump hundreds of results into Claude.
+   * Cheapest first. Deliberately NOT truncated here: nonstop
+   * flights are usually the most expensive, so a "cheapest N" cut
+   * silently drops exactly the offers a nonstop/1-stop/2-stop
+   * comparison needs. Callers that want a short list (the MCP
+   * tool, the results page) apply their own limit.
    */
   offers.sort(
     (a, b) =>
@@ -669,5 +696,5 @@ data_source: "js",
       parseFloat(b.totalAmount)
   );
 
-  return offers.slice(0, 20);
+  return offers;
 }

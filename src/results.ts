@@ -568,7 +568,7 @@ async function handleSearch(
         "cabinClass"
       ) ?? "economy";
 
-    const offers =
+    const offers = (
       await searchFlights({
         origin,
         destination,
@@ -581,7 +581,8 @@ async function handleSearch(
             | "premium_economy"
             | "business"
             | "first",
-      });
+      })
+    ).slice(0, 20);
 
     const html = renderPage(
       origin,

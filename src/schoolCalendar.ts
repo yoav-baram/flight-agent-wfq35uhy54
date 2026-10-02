@@ -28,6 +28,13 @@ export const SCHOOL_BREAKS: SchoolBreak[] = [
     tripWindowStart: "2027-04-17",
     tripWindowEnd: "2027-04-25",
   },
+  {
+    name: "Summer Break",
+    startDate: "2027-06-28",
+    endDate: "2027-09-01",
+    tripWindowStart: "2027-06-28",
+    tripWindowEnd: "2027-09-01",
+  },
  ];
 
 export function getSchoolBreaks(): SchoolBreak[] {

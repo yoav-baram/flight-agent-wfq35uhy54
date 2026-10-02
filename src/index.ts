@@ -28,7 +28,7 @@ server.registerTool(
   },
   async (input) => {
     try {
-      const offers = await searchFlights(input);
+      const offers = (await searchFlights(input)).slice(0, 20);
 
       return {
         content: [
