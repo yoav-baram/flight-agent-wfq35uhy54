@@ -3,11 +3,11 @@
   "lastNotified": {
     "digest::0stops": 1033.17,
     "digest::1stops": 869.98,
-    "digest::2stops": 1028.77
+    "digest::2stops": 935.77
   },
   "lastNotifiedAt": {
-    "digest::0stops": 1792069535250,
-    "digest::1stops": 1792069535250,
-    "digest::2stops": 1792069535250
+    "digest::0stops": 1792104540379,
+    "digest::1stops": 1792104540379,
+    "digest::2stops": 1792104540379
   }
 }
