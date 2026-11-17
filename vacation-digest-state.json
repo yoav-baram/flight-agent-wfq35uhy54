@@ -1,13 +1,13 @@
 {
   "history": {},
   "lastNotified": {
-    "digest::0stops": 1063.17,
-    "digest::1stops": 867.77,
-    "digest::2stops": 896.97
+    "digest::0stops": 1273,
+    "digest::1stops": 841.37,
+    "digest::2stops": 896.57
   },
   "lastNotifiedAt": {
-    "digest::0stops": 1794389562831,
-    "digest::1stops": 1794389562831,
-    "digest::2stops": 1794389562831
+    "digest::0stops": 1794954606893,
+    "digest::1stops": 1794954606893,
+    "digest::2stops": 1794954606893
   }
 }
